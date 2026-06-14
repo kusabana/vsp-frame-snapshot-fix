@@ -1,0 +1,57 @@
+name: build
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: build-${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86
+            toolchain: cmake/toolchain-x86.cmake
+            multilib: true
+          - arch: x64
+            toolchain: ""
+            multilib: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential cmake git
+          if [ "${{ matrix.multilib }}" = "true" ]; then
+            sudo apt-get install -y --no-install-recommends gcc-multilib g++-multilib
+          fi
+
+      - name: Configure
+        run: |
+          args=(-S . -B build -DCMAKE_BUILD_TYPE=Release)
+          if [ -n "${{ matrix.toolchain }}" ]; then
+            args+=("-DCMAKE_TOOLCHAIN_FILE=$PWD/${{ matrix.toolchain }}")
+          fi
+          cmake "${args[@]}"
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Stage artifact
+        run: |
+          mkdir -p out
+          find build -name '*.so' -not -path '*/_deps/*' -exec cp -v {} out/ \;
+          ls -la out
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vsp-frame-snapshot-fix-${{ matrix.arch }}
+          path: out/*.so
+          if-no-files-found: error
