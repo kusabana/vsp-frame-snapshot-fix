@@ -1,54 +1,39 @@
-#include <bit>
-#include <cassert>
-#include <cstdio>
-#include <cstring>
 #include <dlfcn.h>
-#include <link.h>
-#include <memory>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
+#include <mutex>
 
 #include "plugin.hpp"
 #include "symbol.hpp"
-
-long scoped_mprotect::page_size_ = sysconf( _SC_PAGE_SIZE );
 
 frame_snapshot_fix plugin_instance;
 
 auto frame_snapshot_fix::create_empty_snapshot_override(
     void *self, int tickcount, int maxEntities ) -> void * {
-
   std::lock_guard< std::recursive_mutex > lk(
       plugin_instance.frame_snapshots_mutex_ );
-  std::lock_guard< std::mutex > hook_lk(
-      plugin_instance.create_empty_snapshot_hook_mutex_ );
-
-  plugin_instance.create_empty_snapshot_hook_->swap( );
-  auto ret = std::bit_cast<
-      decltype( &frame_snapshot_fix::create_empty_snapshot_override ) >(
-      plugin_instance.create_empty_snapshot_ )( self, tickcount, maxEntities );
-  plugin_instance.create_empty_snapshot_hook_->swap( );
-
-  return ret;
+  auto original = (create_fn) subhook_get_trampoline(
+      plugin_instance.create_empty_snapshot_hook_ );
+  return original( self, tickcount, maxEntities );
 }
 
 auto frame_snapshot_fix::delete_frame_snapshot_override(
     void *self, void *pSnapshot ) -> void {
-  // fix for ...
   if ( !pSnapshot )
     return;
 
   std::lock_guard< std::recursive_mutex > lk(
       plugin_instance.frame_snapshots_mutex_ );
-  std::lock_guard< std::mutex > hook_lk(
-      plugin_instance.delete_frame_snapshot_hook_mutex_ );
+  auto original = (delete_fn) subhook_get_trampoline(
+      plugin_instance.delete_frame_snapshot_hook_ );
+  original( self, pSnapshot );
+}
 
-  plugin_instance.delete_frame_snapshot_hook_->swap( );
-  std::bit_cast<
-      decltype( &frame_snapshot_fix::delete_frame_snapshot_override ) >(
-      plugin_instance.delete_frame_snapshot_ )( self, pSnapshot );
-  plugin_instance.delete_frame_snapshot_hook_->swap( );
+auto frame_snapshot_fix::next_snapshot_override(
+    void *self, const void *pSnapshot ) -> void * {
+  std::lock_guard< std::recursive_mutex > lk(
+      plugin_instance.frame_snapshots_mutex_ );
+  auto original =
+      (next_fn) subhook_get_trampoline( plugin_instance.next_snapshot_hook_ );
+  return original( self, pSnapshot );
 }
 
 auto frame_snapshot_fix::load( valve::factory factory, valve::factory )
@@ -61,52 +46,55 @@ auto frame_snapshot_fix::load( valve::factory factory, valve::factory )
   if ( !engine_handle_ )
     return false;
 
-  create_empty_snapshot_ = sym::resolve(
-      engine_handle_, "_ZN21CFrameSnapshotManager19CreateEmptySnapshotEii" );
-  if ( !create_empty_snapshot_ )
-    return false;
+  struct {
+    const char *symbol;
+    void *override;
+    subhook_t &hook;
+  } targets[] = {
+      { "_ZN21CFrameSnapshotManager19CreateEmptySnapshotEii",
+        (void *) &frame_snapshot_fix::create_empty_snapshot_override,
+        create_empty_snapshot_hook_ },
+      { "_ZN21CFrameSnapshotManager19DeleteFrameSnapshotEP14CFrameSnapshot",
+        (void *) &frame_snapshot_fix::delete_frame_snapshot_override,
+        delete_frame_snapshot_hook_ },
+      { "_ZN21CFrameSnapshotManager12NextSnapshotEPK14CFrameSnapshot",
+        (void *) &frame_snapshot_fix::next_snapshot_override,
+        next_snapshot_hook_ },
+  };
 
-  create_empty_snapshot_hook_ = std::make_unique< simple_hook >(
-      create_empty_snapshot_,
-      std::bit_cast< void * >(
-          &frame_snapshot_fix::create_empty_snapshot_override ) );
+  for ( auto &t : targets ) {
+    void *addr = sym::resolve( engine_handle_, t.symbol );
+    if ( !addr )
+      goto fail;
 
-  delete_frame_snapshot_ = sym::resolve(
-      engine_handle_,
-      "_ZN21CFrameSnapshotManager19DeleteFrameSnapshotEP14CFrameSnapshot" );
-  if ( !delete_frame_snapshot_ )
-    return false;
+    t.hook = subhook_new( addr, t.override );
+    if ( !t.hook || subhook_install( t.hook ) != 0 )
+      goto fail;
 
-  delete_frame_snapshot_hook_ = std::make_unique< simple_hook >(
-      delete_frame_snapshot_,
-      std::bit_cast< void * >(
-          &frame_snapshot_fix::delete_frame_snapshot_override ) );
-
-  // enable hooks
-  create_empty_snapshot_hook_->swap( );
-  delete_frame_snapshot_hook_->swap( );
+    if ( !subhook_get_trampoline( t.hook ) )
+      goto fail;
+  }
 
   return true;
+
+fail:
+  unload( );
+  return false;
 }
 
 auto frame_snapshot_fix::unload( ) -> void {
-  if ( engine_handle_ )
-    dlclose( engine_handle_ );
-
-  // Revert hooks if applied
-  {
-    std::lock_guard< std::mutex > hook_lk(
-        plugin_instance.create_empty_snapshot_hook_mutex_ );
-    if ( std::bit_cast< void * >( create_empty_snapshot_hook_->code( ) + 1 ) !=
-         frame_snapshot_fix::create_empty_snapshot_override )
-      create_empty_snapshot_hook_->swap( );
+  for ( subhook_t *hook : { &create_empty_snapshot_hook_,
+                            &delete_frame_snapshot_hook_,
+                            &next_snapshot_hook_ } ) {
+    if ( *hook ) {
+      subhook_remove( *hook );
+      subhook_free( *hook );
+      *hook = nullptr;
+    }
   }
 
-  {
-    std::lock_guard< std::mutex > hook_lk(
-        plugin_instance.delete_frame_snapshot_hook_mutex_ );
-    if ( std::bit_cast< void * >( delete_frame_snapshot_hook_->code( ) + 1 ) !=
-         frame_snapshot_fix::delete_frame_snapshot_override )
-      delete_frame_snapshot_hook_->swap( );
+  if ( engine_handle_ ) {
+    dlclose( engine_handle_ );
+    engine_handle_ = nullptr;
   }
 }
