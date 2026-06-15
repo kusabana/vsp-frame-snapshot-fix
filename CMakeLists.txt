@@ -15,8 +15,8 @@ set (SUBHOOK_INSTALL OFF CACHE BOOL "" FORCE)
 set (SUBHOOK_STATIC ON CACHE BOOL "" FORCE)
 FetchContent_Declare(
   subhook
-  GIT_REPOSITORY https://github.com/wyrover/subhook
-  GIT_TAG master
+  GIT_REPOSITORY https://github.com/tianocore/edk2-subhook
+  GIT_TAG main
 )
 FetchContent_MakeAvailable(subhook)
 

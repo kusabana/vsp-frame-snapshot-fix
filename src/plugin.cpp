@@ -67,7 +67,11 @@ auto frame_snapshot_fix::load( valve::factory factory, valve::factory )
     if ( !addr )
       goto fail;
 
-    t.hook = subhook_new( addr, t.override );
+#if __x86_64__
+    t.hook = subhook_new( addr, t.override, SUBHOOK_64BIT_OFFSET );
+#else
+    t.hook = subhook_new( addr, t.override, static_cast< subhook_flags_t >( 0 ) );
+#endif
     if ( !t.hook || subhook_install( t.hook ) != 0 )
       goto fail;
 
